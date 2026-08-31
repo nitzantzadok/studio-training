@@ -23,12 +23,17 @@ jobs:
         with:
           node-version: '22'
 
-      - name: בדיקות
-        run: node --test tests/*.test.js
-
+      # הבנייה קודמת לבדיקות: הפריסה לקצה מגישה את המסך הבנוי, ויש בדיקה
+      # שמוודאת בדיוק את זה
       - name: בנייה
         run: |
           node build.mjs
+
+      - name: בדיקות
+        run: node --test tests/*.test.js
+
+      - name: אריזה לאתר
+        run: |
           mkdir -p _site
           # app.html ולא artifact.html: הראשון הוא מסמך שלם עם doctype
           # ועם תגית viewport. artifact.html הוא תוכן בלבד — המארח של
