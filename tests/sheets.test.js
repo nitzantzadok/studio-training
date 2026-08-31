@@ -17,10 +17,16 @@ import {
   shDecodeBytes, shParseDelimited, shSniffDelimiter, shSplitBlocks, shTableFromText, shToTable,
 } from '../src/domain/sheets/table.js';
 import { shIsZip, shReadXlsx } from '../src/domain/sheets/xlsx.js';
+import { shReadFile } from '../src/domain/sheets/read.js';
+import { shLooksLikePerson } from '../src/domain/sheets/person.js';
+import { shAnalyzeWorkbookAsync } from '../src/domain/sheets/build.js';
+import { shParseAny, shParseHtmlTables, shParseJsonRows } from '../src/domain/sheets/table.js';
 import { shFixHeaderless, shMapColumns } from '../src/domain/sheets/columns.js';
 import { shClassifyTable } from '../src/domain/sheets/classify.js';
 import { shAnalyzeWorkbook, shBuildImport } from '../src/domain/sheets/build.js';
-import { constraintCandidates, equipmentCandidates, exerciseCandidates } from '../src/domain/sheets/vocab.js';
+import {
+  constraintCandidates, equipmentCandidates, exerciseCandidates, HEADER_TERMS, shCandidates,
+} from '../src/domain/sheets/vocab.js';
 import { shGvizToMatrix, shGvizUrl, shParseSheetUrl } from '../src/domain/sheets/google.js';
 import {
   SH_PROGRAM_COLUMNS, shProgramFileName, shProgramRows, shProgramsRows, shToCsv, shToTsv,
@@ -886,4 +892,331 @@ test('שתי מטרות בתא אחד, מחוברות בו׳', () => {
     rows: shParseDelimited('שם,גיל,מטרה\nרון,34,חיזוק ויציבה'),
   }]), { studioName: 'ס' });
   assert.deepEqual(out.trainees[0].goals, ['strength', 'posture']);
+});
+
+/* ==================================================================
+   כל הדרכים להכניס גיליון פנימה
+
+   מאמן לא בוחר פורמט — הוא לוקח את מה שיש לו. הבדיקות כאן עוברות על כל
+   הדרכים שבהן גיליון מגיע בפועל: קובץ ods, הדבקה של טבלה מדף, ייצוא JSON,
+   טבלה מיושרת ברווחים, וקבצים שאי אפשר לקרוא ושחייבים להסביר למה.
+   ================================================================== */
+
+const odsFixture = (cells) => makeZip({
+  'mimetype': 'application/vnd.oasis.opendocument.spreadsheet',
+  'content.xml': `<?xml version="1.0"?><office:document-content><office:body><office:spreadsheet>
+    <table:table table:name="מתאמנים">${cells}</table:table>
+  </office:spreadsheet></office:body></office:document-content>`,
+});
+
+test('ods: קובץ LibreOffice נקרא כמו כל גיליון אחר', async () => {
+  const bytes = await odsFixture(
+    '<table:table-row><table:table-cell><text:p>שם</text:p></table:table-cell>'
+    + '<table:table-cell><text:p>גיל</text:p></table:table-cell>'
+    + '<table:table-cell><text:p>הצטרפות</text:p></table:table-cell></table:table-row>'
+    + '<table:table-row><table:table-cell><text:p>רון כהן</text:p></table:table-cell>'
+    + '<table:table-cell office:value-type="float" office:value="34"><text:p>34</text:p></table:table-cell>'
+    + '<table:table-cell office:value-type="date" office:date-value="2024-03-01T00:00:00"/></table:table-row>',
+  );
+  const sheets = await shReadFile(bytes, 'הסטודיו שלי.ods');
+  assert.equal(sheets.length, 1);
+  assert.equal(sheets[0].name, 'מתאמנים');
+  assert.deepEqual(sheets[0].rows[0], ['שם', 'גיל', 'הצטרפות']);
+  assert.deepEqual(sheets[0].rows[1], ['רון כהן', '34', '2024-03-01']);
+});
+
+test('ods: תא ריק שחוזר על עצמו אינו מזיז את העמודות שאחריו', async () => {
+  const bytes = await odsFixture(
+    '<table:table-row><table:table-cell><text:p>שם</text:p></table:table-cell>'
+    + '<table:table-cell table:number-columns-repeated="2"/>'
+    + '<table:table-cell><text:p>מטרה</text:p></table:table-cell></table:table-row>'
+    + '<table:table-row><table:table-cell><text:p>דנה</text:p></table:table-cell>'
+    + '<table:table-cell table:number-columns-repeated="2"/>'
+    + '<table:table-cell><text:p>מסה</text:p></table:table-cell></table:table-row>',
+  );
+  const [sheet] = await shReadFile(bytes, 'a.ods');
+  assert.equal(sheet.rows[1][3], 'מסה');
+});
+
+test('ods נקרא גם כששמו נגמר ב-xlsx: ההכרעה היא לפי תוכן הארכיון', async () => {
+  const bytes = await odsFixture('<table:table-row><table:table-cell><text:p>שם</text:p></table:table-cell>'
+    + '<table:table-cell><text:p>רון</text:p></table:table-cell></table:table-row>');
+  const [sheet] = await shReadFile(bytes, 'trainees.xlsx');
+  assert.deepEqual(sheet.rows[0], ['שם', 'רון']);
+});
+
+test('הדבקה: טבלת HTML מהלוח נשמרת עם גבולות התאים', () => {
+  const rows = shParseAny(`<table><tr><th>שם</th><th>הערה</th></tr>
+    <tr><td>רון כהן</td><td>כאב<br>בכתף</td></tr>
+    <tr><td>דנה&nbsp;לוי</td><td></td></tr></table>`);
+  assert.deepEqual(rows[1], ['רון כהן', 'כאב בכתף']);
+  assert.deepEqual(rows[2], ['דנה לוי', '']);
+});
+
+test('הדבקה: תא ממוזג ב-HTML אינו מסיט את שאר השורה', () => {
+  const rows = shParseAny('<table><tr><td colspan="2">מתאמני הסטודיו</td></tr>'
+    + '<tr><td>שם</td><td>גיל</td></tr><tr><td>רון</td><td>34</td></tr></table>');
+  assert.deepEqual(rows[0], ['מתאמני הסטודיו', '']);
+  assert.deepEqual(rows[2], ['רון', '34']);
+});
+
+test('הדבקה: טבלה שמיושרת ברווחים בלבד מפוצלת לעמודות', () => {
+  const rows = shParseAny('שם        גיל   מטרה\nרון כהן    34    מסה\nדנה לוי    28    כוח');
+  assert.deepEqual(rows[0], ['שם', 'גיל', 'מטרה']);
+  assert.deepEqual(rows[1], ['רון כהן', '34', 'מסה']);
+});
+
+test('הדבקה: רווח בודד בתוך שם אינו נחשב גבול עמודה', () => {
+  const rows = shParseAny('שם,גיל\nרון כהן,34');
+  assert.deepEqual(rows[1], ['רון כהן', '34']);
+});
+
+test('JSON: ייצוא ממערכת אחרת הופך לטבלה עם כותרות', () => {
+  const rows = shParseJsonRows(JSON.stringify([
+    { name: 'רון כהן', age: 34, goals: ['מסה', 'כוח'] },
+    { name: 'דנה לוי', phone: '050-1234567' },
+  ]));
+  assert.deepEqual(rows[0], ['name', 'age', 'goals', 'phone']);
+  assert.deepEqual(rows[1], ['רון כהן', '34', 'מסה, כוח', '']);
+  assert.deepEqual(rows[2], ['דנה לוי', '', '', '050-1234567']);
+});
+
+test('JSON: מערך עטוף באובייקט נמצא גם הוא', () => {
+  const rows = shParseJsonRows('{"ok":true,"trainees":[{"שם":"רון"},{"שם":"דנה"}]}');
+  assert.deepEqual(rows, [['שם'], ['רון'], ['דנה']]);
+});
+
+test('JSON: טקסט שאינו JSON אינו נחטף מהמסלול הרגיל', () => {
+  assert.equal(shParseJsonRows('שם,גיל\nרון,34'), null);
+  assert.deepEqual(shParseAny('שם,גיל\nרון,34')[1], ['רון', '34']);
+});
+
+test('קובץ JSON נקרא דרך אותה נקודת כניסה', async () => {
+  const bytes = new TextEncoder().encode('[{"שם":"רון כהן","גיל":34}]');
+  const [sheet] = await shReadFile(bytes, 'מתאמנים.json');
+  assert.equal(sheet.name, 'מתאמנים');
+  assert.deepEqual(sheet.rows, [['שם', 'גיל'], ['רון כהן', '34']]);
+});
+
+test('CSV בעברית של חלונות נקרא נכון גם בלי סימן סדר', async () => {
+  // windows-1255: "שם,גיל" ואחריו שורה עם שם עברי
+  const bytes = Uint8Array.from([0xf9, 0xed, 0x2c, 0xe2, 0xe9, 0xec, 0x0a, 0xf8, 0xe5, 0xef, 0x2c, 0x33, 0x34]);
+  const [sheet] = await shReadFile(bytes, 'trainees.csv');
+  assert.deepEqual(sheet.rows[0], ['שם', 'גיל']);
+  assert.deepEqual(sheet.rows[1], ['רון', '34']);
+});
+
+test('קובץ xls ישן ו-PDF מוסברים במקום להיקרא כג׳יבריש', async () => {
+  const xls = new Uint8Array([0xd0, 0xcf, 0x11, 0xe0, 0xa1, 0xb1, 0x1a, 0xe1, 0, 0]);
+  await assert.rejects(() => shReadFile(xls, 'ישן.xls'), /xlsx|CSV/);
+  const pdf = new TextEncoder().encode('%PDF-1.7\n...');
+  await assert.rejects(() => shReadFile(pdf, 'תכנית.pdf'), /PDF/);
+  await assert.rejects(() => shReadFile(new Uint8Array(0), 'ריק.csv'), /ריק/);
+});
+
+test('xlsx ממשיך להיקרא דרך נקודת הכניסה האחידה', async () => {
+  const sheets = await shReadFile(await xlsxFixture(), 'הסטודיו.xlsx');
+  assert.deepEqual(sheets.map((s) => s.name), ['מתאמנים', 'ציוד']);
+});
+
+test('כל הדרכים מגיעות לאותו סטודיו: הדבקה, HTML ו-JSON', () => {
+  const expected = (rows) => {
+    const out = shBuildImport(shAnalyzeWorkbook([{ name: 'מתאמנים', rows }]), { studioName: 'ס' });
+    return out.trainees.map((t) => [t.name, t.age]);
+  };
+  const csv = expected(shParseAny('שם,גיל,מטרה\nרון כהן,34,מסה\nדנה לוי,28,כוח'));
+  const html = expected(shParseAny('<table><tr><td>שם</td><td>גיל</td><td>מטרה</td></tr>'
+    + '<tr><td>רון כהן</td><td>34</td><td>מסה</td></tr><tr><td>דנה לוי</td><td>28</td><td>כוח</td></tr></table>'));
+  const json = expected(shParseAny(JSON.stringify([
+    { שם: 'רון כהן', גיל: 34, מטרה: 'מסה' }, { שם: 'דנה לוי', גיל: 28, מטרה: 'כוח' },
+  ])));
+  assert.deepEqual(csv, [['רון כהן', 34], ['דנה לוי', 28]]);
+  assert.deepEqual(html, csv);
+  assert.deepEqual(json, csv);
+});
+
+/* ==================================================================
+   גיליון גדול: לשונית לכל מתאמן
+
+   סטודיו שמנהל לכל מתאמן לשונית משלו מגיע עם מאה לשוניות ואלף שורות בכל
+   אחת. הבדיקות כאן שומרות על שני דברים: שהניתוח נשאר בסדר גודל של שניות
+   ולא של דקות, ושאפשר לנתח אותו בהפוגות בלי להקפיא את המסך.
+   ================================================================== */
+
+const bigWorkbook = (tabs, rowsPer) => {
+  const ex = ['לחיצת חזה', 'סקוואט', 'מתח', 'חתירה', 'לחיצת כתפיים', 'דדליפט'];
+  const first = ['מיקה', 'שי', 'יהוא', 'אילן', 'נועה', 'לודה', 'אריאל', 'יהב', 'נבו', 'אורי'];
+  const last = ['מנדל', 'דמתי', 'כהן', 'אפרים', 'קרן', 'שפירא', 'בוגרוב', 'סימנה', 'שלוש', 'לוי'];
+  const names = [];
+  for (const f of first) for (const l of last) names.push(`${f} ${l}`);
+  return names.slice(0, tabs).map((name) => ({
+    name,
+    rows: [['תרגיל', 'סטים', 'חזרות', 'משקל'],
+      ...Array.from({ length: rowsPer }, (_, i) => [ex[i % ex.length], '3', '10', '40'])],
+  }));
+};
+
+test('גיליון של 60 לשוניות ואלף שורות מנותח בזמן סביר', () => {
+  const started = Date.now();
+  const analysis = shAnalyzeWorkbook(bigWorkbook(60, 1000));
+  const elapsed = Date.now() - started;
+  assert.equal(analysis.sheets.length, 60);
+  assert.ok(analysis.sheets.every((s) => s.role === 'programs'), 'כל לשונית היא תכנית של מתאמן');
+  // לפני המטמון זה לקח דקות, והדפדפן הציע לסגור את הדף
+  assert.ok(elapsed < 20000, `הניתוח לקח ${elapsed}ms`);
+});
+
+test('כל לשונית הופכת למתאמן עם התכנית שלו, בלי לאבד אף אחד', () => {
+  const built = shBuildImport(shAnalyzeWorkbook(bigWorkbook(40, 50)), { studioName: 'ס' });
+  assert.equal(built.trainees.length, 40);
+  assert.equal(built.snapshots.length, 40);
+  assert.equal(new Set(built.trainees.map((t) => t.id)).size, 40, 'מזהים ייחודיים');
+});
+
+test('הניתוח בהפוגות מחזיר בדיוק את אותה תוצאה, ומדווח התקדמות', async () => {
+  const sheets = bigWorkbook(6, 20);
+  const sync = shAnalyzeWorkbook(sheets);
+  const steps = [];
+  let breathed = 0;
+  const async = await shAnalyzeWorkbookAsync(sheets, {
+    onProgress: (done, total) => steps.push([done, total]),
+    breathe: () => { breathed++; return Promise.resolve(); },
+  });
+  assert.deepEqual(async.counts, sync.counts);
+  assert.deepEqual(async.sheets.map((s) => [s.name, s.role]), sync.sheets.map((s) => [s.name, s.role]));
+  assert.deepEqual(steps.at(-1), [6, 6]);
+  assert.equal(breathed, 6);
+});
+
+test('אותה השוואה חוזרת מחזירה את אותה תשובה גם דרך המטמון', () => {
+  const a = shMatch('לחיצת חזה במוט', exerciseCandidates(), { min: 0.66 });
+  const b = shMatch('לחיצת חזה במוט', exerciseCandidates(), { min: 0.66 });
+  assert.deepEqual(a, b);
+  // סף אחר הוא שאלה אחרת, ואסור שהמטמון יחזיר עליה את התשובה הקודמת
+  const strict = shMatch('לחיצת חזה במוט', exerciseCandidates(), { min: 0.999 });
+  assert.ok(!strict || strict.score >= 0.999);
+  assert.equal(shCandidates(HEADER_TERMS), shCandidates(HEADER_TERMS), 'רשימת מועמדים נבנית פעם אחת');
+});
+
+test('יום עם מאות תרגילים נחתך, והמאמן מקבל הסבר איך לפצל אותו', () => {
+  const ex = ['לחיצת חזה', 'סקוואט', 'מתח', 'חתירה'];
+  const rows = [['תרגיל', 'סטים', 'חזרות', 'משקל'],
+    ...Array.from({ length: 400 }, (_, i) => [ex[i % 4], '3', '10', '40'])];
+  const built = shBuildImport(shAnalyzeWorkbook([{ name: 'מיקה מנדל', rows }]), { studioName: 'ס' });
+  const day = built.snapshots[0].program.days[0];
+  assert.equal(day.blocks.length, 40);
+  const warning = built.report.warnings.find((w) => w.includes('תרגילים'));
+  assert.match(warning, /360 שורות/);
+  assert.match(warning, /תאריך/);
+  // הצילום נשאר בגודל שאפשר לשמור בדפדפן
+  assert.ok(JSON.stringify(built.snapshots[0]).length < 60000);
+});
+
+test('תכנית בגודל רגיל אינה נחתכת ואינה מייצרת אזהרה', () => {
+  const rows = [['תרגיל', 'סטים', 'חזרות'],
+    ['לחיצת חזה', '3', '10'], ['סקוואט', '4', '8'], ['חתירה', '3', '12']];
+  const built = shBuildImport(shAnalyzeWorkbook([{ name: 'שי דמתי', rows }]), { studioName: 'ס' });
+  assert.equal(built.snapshots[0].program.days[0].blocks.length, 3);
+  assert.ok(!built.report.warnings.some((w) => w.includes('לא נכנסו לתכנית')));
+});
+
+/* ==================================================================
+   מה נחשב שם של אדם
+
+   זו הטעות שהכי כואבת בייבוא: עמודת תרגילים או רשימת ציוד שנקראת
+   כרשימת מתאמנים, והמאמן פותח את המערכת ומוצא בה "לחיצת חזה" כמתאמן.
+   ================================================================== */
+
+test('שמות של אנשים מתקבלים, ושמות של תרגילים וציוד נפסלים', () => {
+  const people = ['רון כהן', 'דנה', 'מיקה מנדל', 'נועה בן דוד', 'Alex Cohen', 'חן לוי',
+    'שרון אראל', 'יהב רוזנצוייג', 'אור', 'גיא גרימברג'];
+  for (const name of people) assert.ok(shLooksLikePerson(name), `נפסל בטעות: ${name}`);
+
+  const notPeople = ['לחיצת חזה במוט', 'סקוואט', 'מוט אולימפי', 'מכונת חזה', 'חתירה בישיבה',
+    'דחיפת רגליים', 'סה"כ', 'ממוצע', 'שם מלא', 'יום שני', 'מתחילה', 'ירידה במשקל',
+    '054-1234567', 'a@b.com', 'מתאמן', '12', 'משקולות יד'];
+  for (const value of notPeople) assert.ok(!shLooksLikePerson(value), `התקבל בטעות: ${value}`);
+});
+
+test('לשונית תרגילים שסווגה בטעות כמתאמנים אינה מייצרת מתאמנים', () => {
+  const rows = [['שם', 'סטים', 'חזרות'], ['לחיצת חזה במוט', '3', '10'],
+    ['סקוואט', '4', '8'], ['חתירה בישיבה', '3', '12']];
+  const built = shBuildImport(
+    shAnalyzeWorkbook([{ name: 'גיליון', rows }], { overrides: { גיליון: 'trainees' } }),
+    { studioName: 'ס' },
+  );
+  assert.equal(built.trainees.length, 0);
+  assert.equal(built.report.rejectedNames.length, 3);
+  assert.match(built.report.rejectedNames[0].why, /תרגיל/);
+  assert.ok(built.report.warnings.some((w) => w.includes('לא זוהה אף מתאמן')));
+});
+
+test('עמודת תרגילים אינה ממופה כעמודת שם', () => {
+  const table = shTableFromText('תרגיל,סטים\nלחיצת חזה,3\nסקוואט,4\nחתירה,3');
+  const mapped = shMapColumns(table);
+  assert.notEqual(mapped.columns[0].field, 'name');
+});
+
+test('בדיקת שם לא מאטה גיליון גדול', () => {
+  const started = Date.now();
+  for (let i = 0; i < 3000; i++) shLooksLikePerson(`נועה ${i} כהן`);
+  assert.ok(Date.now() - started < 2000, 'בדיקת השמות איטית מדי');
+});
+
+test('סגנון אימון וסטטוס מיובאים מהגיליון', () => {
+  const rows = [['שם', 'גיל', 'מטרה', 'סוג אימון', 'סטטוס'],
+    ['רון כהן', '34', 'מסה', 'כוח + פיתוח גוף', 'פעיל'],
+    ['דנה לוי', '28', 'כושר כללי', 'פונקציונלי', 'לא פעיל']];
+  const built = shBuildImport(shAnalyzeWorkbook([{ name: 'מתאמנים', rows }]), { studioName: 'ס' });
+  const [ron, dana] = built.trainees;
+  assert.deepEqual(ron.trainingStyles, ['strength', 'bodybuilding']);
+  assert.equal(ron.active, true);
+  assert.deepEqual(dana.trainingStyles, ['functional']);
+  assert.equal(dana.active, false);
+});
+
+test('ייבוא לומד רמה, ותק, משקלים ואורך אימון מהתכנית של המתאמן', () => {
+  const trainees = [['שם', 'גיל', 'מין', 'משקל', 'מטרה', 'רמה'],
+    ['רון כהן', '34', 'גבר', '82', 'מסה', 'מתחיל'],
+    ['דנה לוי', '28', 'אישה', '', 'כוח', 'מתחילה']];
+  const ron = [['תרגיל', 'סטים', 'חזרות', 'משקל'],
+    ['סקוואט מוט על הגב', '4', '5', '110'],
+    ['לחיצת חזה במוט', '4', '5', '80'],
+    ['מתח', '3', '8', '0'],
+    ['חתירה בהרכנה', '3', '8', '70']];
+  const dana = [['תרגיל', 'סטים', 'חזרות', 'משקל'],
+    ['לחיצת רגליים במכונה', '3', '12', '45'],
+    ['לחיצת חזה במכונה', '3', '12', '20'],
+    ['משיכת פולי עליון', '3', '12', '27']];
+
+  const built = shBuildImport(shAnalyzeWorkbook([
+    { name: 'מתאמנים', rows: trainees },
+    { name: 'רון כהן', rows: ron },
+    { name: 'דנה לוי', rows: dana },
+  ]), { studioName: 'ס' });
+
+  const byName = Object.fromEntries(built.trainees.map((t) => [t.name, t]));
+  // מוצהר "מתחיל", אבל סקוואט 110 ומתח אומרים אחרת
+  assert.equal(byName['רון כהן'].level, 'intermediate');
+  assert.ok(byName['רון כהן'].trainingAgeMonths >= 12);
+  assert.ok(byName['רון כהן'].knownMovements.includes('pullup'));
+  assert.equal(byName['רון כהן'].history.bb_back_squat.load, 110);
+  assert.ok(byName['רון כהן'].sessionMinutes >= 20);
+
+  // מכונות במשקלים קלים אינן מעלות רמה
+  assert.equal(byName['דנה לוי'].level, 'beginner');
+
+  // והמאמן רואה מה נלמד ולמה
+  const learned = built.report.learned.find((l) => l.name === 'רון כהן');
+  assert.ok(learned.reasons.some((r) => r.includes('מיומנות')), learned.reasons.join(' | '));
+  assert.ok(built.report.warnings.some((w) => w.includes('משקל גוף')), 'אין אזהרה על משקל גוף חסר');
+});
+
+test('ציוד הסטודיו מוסק מהתרגילים כשאין לשונית ציוד', () => {
+  const built = shBuildImport(shAnalyzeWorkbook([
+    { name: 'מתאמנים', rows: [['שם', 'מטרה'], ['רון כהן', 'מסה']] },
+    { name: 'רון כהן', rows: [['תרגיל', 'סטים', 'חזרות', 'משקל'], ['לחיצת רגליים במכונה', '3', '12', '80']] },
+  ]), { studioName: 'ס' });
+  assert.ok(built.studios[0].equipment.some((e) => e.item === 'leg_press'));
+  assert.ok(built.report.warnings.some((w) => w.includes('זוהו מתוך התרגילים')));
 });

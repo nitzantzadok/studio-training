@@ -8,7 +8,10 @@ import {
   sortMeasurements, series, summary, allSeries,
   EXERCISES, CONSTRAINTS, taxonomy,
 } from '../src/index.js';
-import { FLAGS, STRESS_KEYS } from '../src/domain/exercises.js';
+import { BY_ID, FLAGS, STRESS_KEYS } from '../src/domain/exercises.js';
+import { prescribe } from '../src/engine/prescription.js';
+import { resolveLevel, levelIndex } from '../src/domain/level.js';
+import { inferTraineeProfile } from '../src/domain/inference.js';
 import { swapExercise, generateWeeklyProgram } from '../src/engine/generate.js';
 import { STUDIOS, TRAINEES } from '../src/seed.js';
 
@@ -155,12 +158,26 @@ test('תרגיל שהמתאמן לא אוהב לא מופיע', () => {
 
 // ---------------------------------------------------------------- חלוקה ונפח
 test('בחירת החלוקה מתאימה למספר ימי האימון', () => {
-  const base = { level: 'intermediate', primaryGoal: 'hypertrophy', goals: ['hypertrophy'], constraints: [] };
+  // 'auto' מחזיר את ההכרעה למנוע; ברירת המחדל של מתאמן חדש היא גוף מלא
+  const base = { level: 'intermediate', primaryGoal: 'hypertrophy', goals: ['hypertrophy'], constraints: [], preferredSplit: 'auto' };
   const studio = normalizeStudio(STUDIOS[0]);
   assert.equal(chooseSplit(normalizeTrainee({ ...base, daysPerWeek: 2 }), studio).split, 'full_body');
   assert.equal(chooseSplit(normalizeTrainee({ ...base, daysPerWeek: 3 }), studio).split, 'abc');
   assert.equal(chooseSplit(normalizeTrainee({ ...base, daysPerWeek: 4, level: 'beginner' }), studio).split, 'upper_lower');
   assert.equal(chooseSplit(normalizeTrainee({ ...base, daysPerWeek: 6 }), studio).days.length, 6);
+});
+
+test('ברירת המחדל היא גוף מלא, ובחירה של המאמן גוברת עליה', () => {
+  const studio = normalizeStudio(STUDIOS[0]);
+  const base = { level: 'intermediate', primaryGoal: 'hypertrophy', daysPerWeek: 4 };
+  // בלי בחירה — גוף מלא, גם כשהמנוע היה בוחר אחרת
+  assert.equal(chooseSplit(normalizeTrainee(base), studio).split, 'full_body');
+  // בחירה מפורשת של המאמן גוברת
+  assert.equal(chooseSplit(normalizeTrainee({ ...base, preferredSplit: 'push_pull_legs' }), studio).split, 'push_pull_legs');
+  // והמתאמן גובר על ברירת המחדל של הסטודיו
+  const withStudioPref = normalizeStudio({ ...STUDIOS[0], preferredSplit: 'abc' });
+  assert.equal(chooseSplit(normalizeTrainee({ ...base, preferredSplit: 'upper_lower' }), withStudioPref).split, 'upper_lower');
+  assert.equal(chooseSplit(normalizeTrainee({ ...base, preferredSplit: 'auto' }), withStudioPref).split, 'abc');
 });
 
 test('שבוע דילוד מוריד נפח ומעלה RIR', () => {
@@ -533,4 +550,159 @@ test('מדידה ריקה או תאריך לא תקין אינם שוברים כ
     assert.equal(m.weightKg, null);
   }
   assert.deepEqual(allSeries(clean), [], 'נוצרה סדרה בלי נתונים');
+});
+
+/* ---------------------------------------------------------- סגנון אימון */
+
+test('סגנון האימון משנה את המרשם בפועל', () => {
+  const ex = BY_ID.barbell_bench_press || EXERCISES.find((x) => x.type === 'compound');
+  const base = { name: 'ת', level: 'intermediate', primaryGoal: 'hypertrophy' };
+  const plain = prescribe(ex, normalizeTrainee(base));
+  const strength = prescribe(ex, normalizeTrainee({ ...base, trainingStyles: ['strength'] }));
+  const bb = prescribe(ex, normalizeTrainee({ ...base, trainingStyles: ['bodybuilding'] }));
+
+  assert.ok(strength.repsMax <= plain.repsMax, 'כוח אינו מוריד את טווח החזרות');
+  assert.ok(strength.restSec > plain.restSec, 'כוח אינו מאריך את המנוחה');
+  assert.ok(bb.repsMin >= plain.repsMin, 'פיתוח גוף אינו מעלה חזרות');
+  assert.ok(bb.restSec < plain.restSec, 'פיתוח גוף אינו מקצר מנוחה');
+
+  // שילוב של שניים יושב בין שניהם ואינו קיצוני מאף אחד מהם
+  const both = prescribe(ex, normalizeTrainee({ ...base, trainingStyles: ['strength', 'bodybuilding'] }));
+  assert.ok(both.restSec > bb.restSec && both.restSec < strength.restSec);
+});
+
+test('סגנון אימון אינו מוציא את החזרות מגבולות התרגיל', () => {
+  for (const styles of [['strength'], ['endurance'], ['bodybuilding', 'endurance']]) {
+    for (const ex of EXERCISES.filter((x) => x.type === 'compound' || x.type === 'isolation').slice(0, 60)) {
+      const rx = prescribe(ex, normalizeTrainee({ name: 'ת', trainingStyles: styles }));
+      assert.ok(rx.repsMin >= ex.repMin && rx.repsMax <= ex.repMax,
+        `${ex.id} עם ${styles}: ${rx.reps} מחוץ ל-${ex.repMin}-${ex.repMax}`);
+      assert.ok(rx.repsMin <= rx.repsMax, `${ex.id}: טווח הפוך`);
+      assert.ok(rx.sets >= 1);
+    }
+  }
+});
+
+test('תכנית נבנית ועוברת בקרת איכות גם עם שילוב סגנונות', () => {
+  const studio = STUDIOS[0];
+  for (const styles of [['strength'], ['bodybuilding'], ['athletic', 'functional'], ['rehab'], ['mobility', 'endurance']]) {
+    const res = buildProgram({ ...TRAINEES[1], trainingStyles: styles }, studio);
+    assert.ok(res.ok, `${styles}: ${res.errors?.[0]}`);
+    const blocking = res.program.qa.issues.filter((i) => i.level === 'error');
+    assert.equal(blocking.length, 0, `${styles}: ${blocking[0]?.message}`);
+    assert.ok(res.program.qa.passed, `${styles}: בקרת האיכות נכשלה`);
+  }
+});
+
+test('מתאמן לא פעיל נשמר כרשומה מלאה ואינו נמחק', () => {
+  const t = normalizeTrainee({ name: 'רון', active: false, inactiveReason: 'חופשה' });
+  assert.equal(t.active, false);
+  assert.equal(t.inactiveReason, 'חופשה');
+  assert.equal(t.name, 'רון');
+  // וברירת המחדל לרשומה ישנה בלי השדה היא פעיל
+  assert.equal(normalizeTrainee({ name: 'דנה' }).active, true);
+});
+
+/* -------------------------------------------- לימוד הרמה מהאימונים שהיו */
+
+test('מוצהר "מתחיל" עם סקוואט כבד ומתח — הרמה עולה, והנימוק מוצג', () => {
+  const t = {
+    name: 'רון', level: 'beginner', trainingAgeMonths: 0, weightKg: 82, sex: 'male',
+    history: { bb_back_squat: { load: 110 }, bb_bench_press: { load: 80 } },
+    knownMovements: ['pullup'],
+  };
+  const r = resolveLevel(normalizeTrainee(t), BY_ID);
+  assert.ok(levelIndex(r.label) >= 1, `נשאר ${r.label}`);
+  assert.ok(r.reasons.some((x) => x.includes('הועלתה')), r.reasons.join(' | '));
+  // ואין סתירה: אין גם "הועלתה" וגם "הותאמה כלפי מטה"
+  assert.ok(!r.reasons.some((x) => x.includes('הותאמה')), r.reasons.join(' | '));
+});
+
+test('משקלים מוחלטים מעלים רמה גם בלי משקל גוף', () => {
+  const t = normalizeTrainee({
+    name: 'ד', level: 'beginner', trainingAgeMonths: 24,
+    history: { bb_back_squat: { load: 95 }, bb_bench_press: { load: 72 } },
+  });
+  const r = resolveLevel(t, BY_ID);
+  assert.ok(levelIndex(r.label) >= 2, `נשאר ${r.label}`);
+  assert.ok(r.reasons.some((x) => x.includes('הערכה גסה')), r.reasons.join(' | '));
+});
+
+test('היעדר נתונים אינו מוריד רמה, וראיה חלקית אינה מספיקה', () => {
+  const empty = resolveLevel(normalizeTrainee({ name: 'x', level: 'advanced', trainingAgeMonths: 60 }), BY_ID);
+  assert.equal(empty.label, 'advanced');
+  assert.equal(empty.confidence, 'low');
+
+  // רישום בודד וחלש: מותר לו להעלות דרגה אחת (מי שעושה סקוואט מוט אינו
+  // מתחיל ביום הראשון), אבל לא יותר מזה
+  const one = resolveLevel(normalizeTrainee({
+    name: 'y', level: 'beginner', weightKg: 80, sex: 'male', history: { bb_back_squat: { load: 40 } },
+  }), BY_ID);
+  assert.equal(one.label, 'novice');
+});
+
+test('ראיה רחבה של משקלים נמוכים מורידה רמה אחת, ולא יותר', () => {
+  const weak = {
+    name: 'ז', level: 'advanced', trainingAgeMonths: 60, weightKg: 80, sex: 'male',
+    history: { bb_back_squat: { load: 40 }, bb_bench_press: { load: 25 }, lat_pulldown: { load: 30 } },
+  };
+  const r = resolveLevel(normalizeTrainee(weak), BY_ID);
+  assert.equal(r.label, 'intermediate');
+  assert.ok(r.reasons.some((x) => x.includes('הותאמה')));
+
+  // התרגילים הטכניים שהוא כבר מבצע נשארים פתוחים לו למרות ההתאמה
+  const withSkill = normalizeTrainee({ ...weak, knownMovements: ['pullup'] });
+  assert.ok(withSkill.knownMovements.includes('pullup'));
+});
+
+test('תרגיל טכני בודד אינו הופך מתחיל לבינוני', () => {
+  const one = resolveLevel(normalizeTrainee({
+    name: 'א', level: 'beginner', trainingAgeMonths: 6, history: { bb_back_squat: { load: 40 } },
+  }), BY_ID);
+  assert.equal(one.label, 'novice');
+
+  const two = resolveLevel(normalizeTrainee({
+    name: 'ב', level: 'beginner', trainingAgeMonths: 24,
+    history: { bb_back_squat: { load: 40 } }, knownMovements: ['pullup'],
+  }), BY_ID);
+  assert.equal(two.label, 'intermediate');
+});
+
+test('הפרופיל הנלמד מתכניות קודמות ממלא רמה, ותק, תרגילים ידועים ומשקלים', () => {
+  const programs = [{
+    days: [{
+      blocks: [
+        { exercise: { id: 'bb_back_squat' }, load: { kg: 100 }, prescription: { repsMin: 5 } },
+        { exercise: { id: 'bb_bench_press' }, load: { kg: 70 }, prescription: { repsMin: 5 } },
+        { exercise: { id: 'pullup' }, prescription: { repsMin: 8 } },
+      ],
+    }],
+  }];
+  const profile = inferTraineeProfile(normalizeTrainee({ name: 'ר', level: 'beginner' }), { programs });
+  assert.equal(profile.level.label, 'intermediate');
+  assert.equal(profile.trainingAgeMonths, 12);
+  assert.ok(profile.knownMovements.includes('pullup'));
+  assert.equal(profile.history.bb_back_squat.load, 100);
+  assert.ok(profile.equipmentSeen.includes('barbell'));
+  assert.ok(profile.level.reasons.length >= 2);
+});
+
+test('תכנית של מכונות קלות אינה הופכת מתחיל למתקדם', () => {
+  const programs = [{
+    days: [{
+      blocks: [
+        { exercise: { id: 'machine_chest_press' }, load: { kg: 20 }, prescription: { repsMin: 12 } },
+        { exercise: { id: 'leg_press' }, load: { kg: 45 }, prescription: { repsMin: 12 } },
+      ],
+    }],
+  }];
+  const profile = inferTraineeProfile(normalizeTrainee({ name: 'ד', level: 'beginner' }), { programs });
+  assert.equal(profile.level.label, 'beginner');
+});
+
+test('תרגיל שיובא ולא זוהה במאגר אינו ראיה לרמה', () => {
+  const programs = [{ days: [{ blocks: [{ exercise: { id: 'imported_משהו' }, load: { kg: 200 } }] }] }];
+  const profile = inferTraineeProfile(normalizeTrainee({ name: 'x', level: 'beginner' }), { programs });
+  assert.equal(profile.level.confidence, 'none');
+  assert.equal(profile.level.label, 'beginner');
 });

@@ -15,6 +15,8 @@ import { EQUIPMENT_LABELS } from '../labels.js';
 import { GOALS, LEVELS } from '../taxonomy.js';
 import { shClassifyTable, shSheetPersonName } from './classify.js';
 import { shKeyValueTable, shSplitBlocks, shToTable } from './table.js';
+import { shPersonCheck } from './person.js';
+import { inferTraineeProfile } from '../inference.js';
 import { shCell, shFixHeaderless, shMapColumns } from './columns.js';
 import {
   shBool, shDate, shEmpty, shMatch, shMatchAll, shMatchPhrase, shNorm, shNum, shPhone, shEmail,
@@ -23,7 +25,7 @@ import {
 import {
   constraintCandidates, equipmentCandidates, exerciseCandidates, GOAL_TERMS, IGNORED_FIELDS,
   LEVEL_TERMS, LIFESTYLE_TERMS, SEVERITY_TERMS, SEX_TERMS, shCandidates, SH_FIELD_LABELS,
-  SIDE_TERMS, SPORT_TERMS, WEEKDAY_TERMS,
+  SIDE_TERMS, SPORT_TERMS, TRAINING_STYLE_TERMS, WEEKDAY_TERMS,
 } from './vocab.js';
 
 const GOAL_CANDS = shCandidates(GOAL_TERMS);
@@ -34,10 +36,14 @@ const LIFESTYLE_CANDS = shCandidates(LIFESTYLE_TERMS);
 const SEVERITY_CANDS = shCandidates(SEVERITY_TERMS);
 const SIDE_CANDS = shCandidates(SIDE_TERMS);
 const WEEKDAY_CANDS = shCandidates(WEEKDAY_TERMS);
+const STYLE_CANDS = shCandidates(TRAINING_STYLE_TERMS);
 
 /** שורות סיכום בתחתית גיליון — נתון שנראה כמו מתאמן ואינו מתאמן. */
 // בלי \b: בעברית אין גבול-מילה במובן של ביטוי רגולרי, ולכן "סה\"כ" בסוף שורה
 // לא היה נתפס והשורה הייתה הופכת למתאמן בשם "סה\"כ".
+/** גבול תרגילים ליום אימון אחד. מעבר לזה זה כבר לא יום אימון. */
+const MAX_BLOCKS_PER_DAY = 40;
+
 const SUMMARY_ROW = /^(סה"?כ|סהכ|סיכום|ממוצע|total|sum|average|avg)(\s|:|$)/i;
 
 /**
@@ -45,12 +51,12 @@ const SUMMARY_ROW = /^(סה"?כ|סהכ|סיכום|ממוצע|total|sum|average|a
  * @param {Array<{name:string, rows:string[][]}>} sheets לשוניות גולמיות
  * @param {{overrides?:Record<string,string>}} opts תפקיד שהמאמן כפה ללשונית
  */
-export function shAnalyzeWorkbook(sheets, { overrides = {}, columnOverrides = {} } = {}) {
-  /*
-   * לשונית אחת יכולה להחזיק יותר מטבלה אחת — רשימת מתאמנים למעלה ורשימת
-   * ציוד מתחתיה, מופרדות בשורות ריקות. כל גוש נבדק בנפרד, אחרת השני נבלע
-   * בראשון ונקרא כשורות פגומות.
-   */
+/*
+ * לשונית אחת יכולה להחזיק יותר מטבלה אחת — רשימת מתאמנים למעלה ורשימת
+ * ציוד מתחתיה, מופרדות בשורות ריקות. כל גוש נבדק בנפרד, אחרת השני נבלע
+ * בראשון ונקרא כשורות פגומות.
+ */
+function expandBlocks(sheets) {
   const expanded = [];
   for (const sheet of sheets) {
     if (sheet.table || !sheet.rows) { expanded.push(sheet); continue; }
@@ -60,9 +66,12 @@ export function shAnalyzeWorkbook(sheets, { overrides = {}, columnOverrides = {}
       expanded.push({ name, table: shToTable(rows, { name }) });
     });
   }
+  return expanded;
+}
 
-  const analyzed = [];
-  for (const sheet of expanded) {
+/** ניתוח של לשונית אחת. מופרד כדי שאפשר יהיה לנתח גיליון גדול בהפוגות. */
+function analyzeSheet(sheet, overrides, columnOverrides) {
+  {
     const table = shFixHeaderless(sheet.table || sheet);
     const auto = shClassifyTable(table);
     const role = overrides[sheet.name] || auto.role;
@@ -78,7 +87,7 @@ export function shAnalyzeWorkbook(sheets, { overrides = {}, columnOverrides = {}
       col.why = 'נבחר ידנית';
       if (col.field) mapped.byField[col.field] = col.index;
     }
-    analyzed.push({
+    return {
       name: sheet.name || '',
       table,
       role,
@@ -100,12 +109,39 @@ export function shAnalyzeWorkbook(sheets, { overrides = {}, columnOverrides = {}
         candidates: c.candidates.map((s) => ({ field: s.field, label: SH_FIELD_LABELS[s.field] || s.field })),
       })),
       headerless: !!table.headerless,
-    });
+    };
   }
+}
 
+const withCounts = (analyzed) => {
   const counts = {};
   for (const s of analyzed) counts[s.role] = (counts[s.role] || 0) + s.rowCount;
   return { sheets: analyzed, counts };
+};
+
+export function shAnalyzeWorkbook(sheets, { overrides = {}, columnOverrides = {} } = {}) {
+  return withCounts(expandBlocks(sheets).map((sheet) => analyzeSheet(sheet, overrides, columnOverrides)));
+}
+
+/**
+ * אותו ניתוח, בהפוגות.
+ *
+ * גיליון של סטודיו אמיתי הוא לפעמים לשונית לכל מתאמן — מאה לשוניות ויותר.
+ * ניתוח רצוף שלהן תופס את החוט היחיד של הדפדפן, המסך קופא, וכרום מציע
+ * לסגור את הדף. כאן נעצרים בין לשונית ללשונית, כך שהמסך ממשיך להגיב
+ * ואפשר להראות התקדמות אמיתית.
+ */
+export async function shAnalyzeWorkbookAsync(sheets, {
+  overrides = {}, columnOverrides = {}, onProgress = null, breathe = null,
+} = {}) {
+  const expanded = expandBlocks(sheets);
+  const analyzed = [];
+  for (let i = 0; i < expanded.length; i++) {
+    analyzed.push(analyzeSheet(expanded[i], overrides, columnOverrides));
+    if (onProgress) onProgress(i + 1, expanded.length, expanded[i].name || '');
+    if (breathe) await breathe();
+  }
+  return withCounts(analyzed);
 }
 
 /* ------------------------------------------------------------------ ערכים */
@@ -191,8 +227,17 @@ function traineeFromRow(row, byField, ctx) {
   const first = cell('firstName'); const last = cell('lastName');
   let name = cell('name').trim();
   if (!name && (first || last)) name = `${first} ${last}`.trim();
-  // תא שכולו מספר אינו שם. שם שיש בו ספרה ("מתאמן 3", "דנה 2") הוא כן שם.
-  if (!name || SUMMARY_ROW.test(name) || /^[\d.,\s+-]+$/.test(name)) return null;
+  if (!name || SUMMARY_ROW.test(name)) return null;
+  /*
+   * לא כל תא בעמודה הראשונה הוא אדם. עמודת תרגילים או רשימת ציוד שנקראה
+   * בטעות כרשימת מתאמנים הייתה מכניסה למערכת "לחיצת חזה" ו"מוט אולימפי"
+   * כמתאמנים — וזה מה שהמאמן רואה כשהוא פותח את המסך.
+   */
+  const person = shPersonCheck(name);
+  if (!person.ok) {
+    if (ctx.rejected) ctx.rejected.push({ value: name, why: person.why });
+    return null;
+  }
 
   const t = { name, importedFrom: ctx.sheetName };
   const setIf = (key, value) => { if (value !== null && value !== undefined && value !== '') t[key] = value; };
@@ -277,8 +322,15 @@ function traineeFromRow(row, byField, ctx) {
     if (shEmpty(col.header)) continue;
     extras.push(`${col.header.trim()}: ${String(row[col.index]).trim()}`);
   }
+  // סגנון האימון: עמודה אחת יכולה להחזיק כמה סגנונות ("כוח + פונקציונלי")
+  const styles = shSplitList(cell('trainingStyle'))
+    .map((part) => shMatch(part, STYLE_CANDS, { min: 0.75 })?.key)
+    .filter(Boolean);
+  if (styles.length) t.trainingStyles = [...new Set(styles)];
+
   const active = shBool(cell('status'));
-  if (active === false) { t.inactive = true; extras.push('מסומן כלא פעיל בגיליון'); }
+  if (active === false) { t.inactive = true; t.active = false; extras.push('מסומן כלא פעיל בגיליון'); }
+  if (active === true) t.active = true;
   if (extras.length) t.notes = extras.join(' · ').slice(0, 600);
 
   const branch = cell('studio').trim();
@@ -610,6 +662,8 @@ export function shBuildImport(analysis, {
     customExercises: new Map(),
     exerciseCands: exerciseCandidates(),
     traineeNames: [],
+    // שורות שנפסלו כשם של אדם — מוצגות למאמן כדי שיראה מה לא נכנס ולמה
+    rejected: [],
   };
   const perSheet = [];
   const warnings = [];
@@ -622,7 +676,7 @@ export function shBuildImport(analysis, {
     const flat = shKeyValueTable(sheet.table);
     const mapped = shMapColumns(flat, { role: 'trainees' });
     const t = traineeFromRow(flat.rows[0] || [], mapped.byField, {
-      sheetName: sheet.name, columns: mapped.columns, unmatched: ctx.unmatched,
+      sheetName: sheet.name, columns: mapped.columns, unmatched: ctx.unmatched, rejected: ctx.rejected,
     }) || (shSheetPersonName(sheet.name) ? { name: shSheetPersonName(sheet.name) } : null);
     if (!t) { perSheet.push({ name: sheet.name, role: sheet.role, rows: sheet.rowCount, built: 0, what: 'מתאמנים' }); continue; }
     // בכרטיס אישי השם לא תמיד כתוב בפנים — אז שם הלשונית הוא השם
@@ -636,7 +690,7 @@ export function shBuildImport(analysis, {
     let added = 0;
     for (const row of sheet.table.rows) {
       const t = traineeFromRow(row, sheet.byField, {
-        sheetName: sheet.name, columns: sheet.columns, unmatched: ctx.unmatched,
+        sheetName: sheet.name, columns: sheet.columns, unmatched: ctx.unmatched, rejected: ctx.rejected,
       });
       if (!t) continue;
       const key = shNorm(t.name);
@@ -644,6 +698,15 @@ export function shBuildImport(analysis, {
       added++;
     }
     perSheet.push({ name: sheet.name, role: sheet.role, rows: sheet.rowCount, built: added, what: 'מתאמנים' });
+    /*
+     * לשונית שסומנה "מתאמנים" ולא יצא ממנה אף אדם היא כמעט תמיד לשונית
+     * אחרת שסווגה לא נכון. עדיף לומר את זה מפורשות מאשר להציג 0 בשקט.
+     */
+    if (!added && sheet.table.rows.length) {
+      const why = ctx.rejected.at(-1)?.why || '';
+      warnings.push(`בלשונית "${sheet.name}" לא זוהה אף מתאמן${why ? ` — ${why}` : ''}. `
+        + 'אם זו לשונית תרגילים או ציוד, אפשר לשנות את סוג הלשונית במסך הזה.');
+    }
   }
   ctx.traineeNames = [...traineesByKey.values()].map((t) => t.name);
 
@@ -723,11 +786,23 @@ export function shBuildImport(analysis, {
         sessionMinutes: null,
         segments: [],
         estimatedMinutes: 0,
-        blocks,
+        blocks: blocks.slice(0, MAX_BLOCKS_PER_DAY),
         unfilledSlots: [],
         droppedForTime: [],
         status: 'planned',
       }));
+      /*
+       * יום אימון אחד אינו מכיל מאות תרגילים. לשונית כזאת היא כמעט תמיד
+       * יומן ביצועים של חודשים שנשמר בלי עמודת יום או תאריך, ובלי גבול
+       * היא הופכת ל"תכנית" שאי אפשר לקרוא — ותופסת את כל האחסון של
+       * הדפדפן. חותכים, ואומרים למאמן בדיוק מה קרה ואיך לתקן.
+       */
+      const trimmed = [...entry.days.values()].reduce((n, b) => n + Math.max(0, b.length - MAX_BLOCKS_PER_DAY), 0);
+      if (trimmed) {
+        warnings.push(`בלשונית "${sheet.name}" יש יום עם יותר מ-${MAX_BLOCKS_PER_DAY} תרגילים — `
+          + `${trimmed} שורות לא נכנסו לתכנית. אם אלה אימונים מתאריכים שונים, הוספת עמודת `
+          + '"תאריך" או "יום" בגיליון תפצל אותם לאימונים נפרדים.');
+      }
       programs.push({ traineeKey: key, traineeName: entry.name, days, sheetName: sheet.name });
       built += days.length;
     }
@@ -880,6 +955,69 @@ export function shBuildImport(analysis, {
   });
 
   /*
+   * מה שהתכניות הקודמות מספרות על המתאמן.
+   *
+   * זה הרווח האמיתי מייבוא: לא רק להעביר שמות, אלא לקרוא את מה שהמתאמן
+   * כבר עשה. תרגילים, משקלים וסטים מלמדים על הרמה, על הוותק, על התרגילים
+   * הטכניים שהוא כבר מבצע ועל משקלי העבודה שלו — וכל אלה נכנסים לכרטיס
+   * במקום להישאר כטבלה שאיש לא קורא.
+   */
+  const learned = [];
+  for (const t of trainees) {
+    const own = snapshots.filter((s) => s.traineeId === t.id).map((s) => s.program);
+    const ownLogs = t.sessionLog || [];
+    if (!own.length && !ownLogs.length && !Object.keys(t.history || {}).length) continue;
+
+    const profile = inferTraineeProfile(t, { programs: own, logs: ownLogs });
+    if (profile.level.confidence === 'none') continue;
+
+    t.level = profile.level.label;
+    t.levelSource = 'inferred';
+    t.levelConfidence = profile.level.confidence;
+    t.levelReasons = profile.level.reasons;
+    if (profile.trainingAgeMonths) t.trainingAgeMonths = profile.trainingAgeMonths;
+    if (profile.knownMovements.length) t.knownMovements = profile.knownMovements;
+    if (Object.keys(profile.history).length) t.history = { ...profile.history, ...(t.history || {}) };
+    if (profile.daysPerWeek && t.daysPerWeek === undefined) t.daysPerWeek = profile.daysPerWeek;
+    if (profile.sessionMinutes && t.sessionMinutes === undefined) t.sessionMinutes = profile.sessionMinutes;
+    learned.push({ name: t.name, level: t.level, confidence: profile.level.confidence, reasons: profile.level.reasons });
+  }
+  if (learned.length) {
+    warnings.push(`ל-${learned.length} מתאמנים נלמדה הרמה מהתכניות והמשקלים שבגיליון `
+      + '— הפירוט מופיע ברשימה למטה, ואפשר לשנות כל רמה ידנית בכרטיס המתאמן.');
+    /*
+     * כוח יחסי הוא הראיה החזקה ביותר, והוא דורש משקל גוף. כשהוא חסר
+     * ההערכה נשענת על משקלים מוחלטים — וזה בדיוק המקום לומר למאמן שהשלמה
+     * של נתון אחד תשפר את כל התכניות של האנשים האלה.
+     */
+    const noWeight = learned.filter((l) => !trainees.find((t) => t.name === l.name)?.weightKg);
+    if (noWeight.length) {
+      warnings.push(`ל-${noWeight.length} מתאמנים אין משקל גוף בגיליון, ולכן הרמה שלהם הוערכה `
+        + 'לפי משקלי עבודה מוחלטים בלבד. השלמת משקל הגוף (בכרטיס המתאמן או בעמודה בגיליון) '
+        + 'הופכת את ההערכה למדויקת.');
+    }
+  }
+
+  /*
+   * ציוד שנלמד מהתרגילים: סטודיו שאין לו לשונית ציוד עדיין מגלה את עצמו
+   * דרך התכניות. מי שרשם ללקוחות לחיצת רגליים — יש לו מכונת לחיצת רגליים.
+   */
+  if (!studios[0].equipment.length) {
+    const seen = new Map();
+    for (const t of trainees) {
+      const own = snapshots.filter((s) => s.traineeId === t.id).map((s) => s.program);
+      for (const item of inferTraineeProfile(t, { programs: own }).equipmentSeen) {
+        seen.set(item, (seen.get(item) || 0) + 1);
+      }
+    }
+    if (seen.size) {
+      studios[0].equipment = [...seen.keys()].map((item) => ({ item, count: 1 }));
+      warnings.push(`לא נמצאה לשונית ציוד, ולכן ${seen.size} פריטי ציוד זוהו מתוך התרגילים שבתכניות. `
+        + 'כדאי לעבור על הרשימה במסך הסטודיו ולהשלים כמויות ומשקלים.');
+    }
+  }
+
+  /*
    * סניף בלי לשונית ציוד משלו מקבל את הציוד של הסטודיו הראשי.
    * זו ההתנהגות הנכונה כמעט תמיד: רשת כותבת רשימת ציוד אחת. סניף שבאמת
    * שונה נערך אחר כך במסך הסטודיו, וההודעה בדוח אומרת זאת במפורש.
@@ -931,6 +1069,8 @@ export function shBuildImport(analysis, {
         attendance: attendance.reduce((n, a) => n + a.dates.length, 0),
         customExercises: ctx.customExercises.size,
       },
+      rejectedNames: ctx.rejected.slice(0, 40),
+      learned,
       unmatched: {
         equipment: [...ctx.unmatched.equipment].slice(0, 40),
         exercises: [...ctx.unmatched.exercises].slice(0, 40),
